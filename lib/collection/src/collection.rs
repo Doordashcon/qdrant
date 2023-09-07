@@ -1849,6 +1849,10 @@ impl Collection {
             .get_shard(&shard_id)
             .ok_or_else(|| shard_not_found_error(shard_id))?;
 
+        // TODO:
+        //   Check that shard snapshot is compatible with the collection
+        //   (see `VectorsConfig::check_compatible_with_segment_config`)
+
         replica_set
             .restore_local_replica_from(snapshot_shard_path)
             .await
