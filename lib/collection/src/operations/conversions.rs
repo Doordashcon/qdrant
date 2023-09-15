@@ -5,13 +5,17 @@ use api::grpc::conversions::{from_grpc_dist, payload_to_proto, proto_to_payloads
 use api::grpc::qdrant::quantization_config_diff::Quantization;
 use api::grpc::qdrant::update_collection_cluster_setup_request::Operation as ClusterOperationsPb;
 use itertools::Itertools;
-use segment::data_types::vectors::{NamedVector, VectorStruct, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{
+    Named, NamedRecoQuery, NamedVector, VectorStruct, DEFAULT_VECTOR_NAME,
+};
 use segment::types::{Distance, QuantizationConfig};
+use segment::vector_storage::query::reco_query::RecoQuery;
 use tonic::Status;
 
 use super::types::{
     BaseGroupRequest, CoreSearchRequest, GroupsResult, PointGroup, QueryEnum,
-    RecommendGroupsRequest, SearchGroupsRequest, VectorParamsDiff, VectorsConfigDiff,
+    RecommendGroupsRequest, RecommendStrategy, SearchGroupsRequest, VectorParamsDiff,
+    VectorsConfigDiff,
 };
 use crate::config::{
     default_replication_factor, default_write_consistency_factor, CollectionConfig,
@@ -739,13 +743,41 @@ impl<'a> From<CollectionSearchRequest<'a>> for api::grpc::qdrant::SearchPoints {
     }
 }
 
+impl From<QueryEnum> for api::grpc::qdrant::QueryEnum {
+    fn from(value: QueryEnum) -> Self {
+        match value {
+            QueryEnum::Nearest(_vector) => {
+                unimplemented!("Nearest query is used only through SearchPointsInternal for now")
+            }
+            QueryEnum::RecommendBestScore(named) => api::grpc::qdrant::QueryEnum {
+                query: Some(api::grpc::qdrant::query_enum::Query::RecommendBestScore(
+                    api::grpc::qdrant::RecoQuery {
+                        positives: named
+                            .query
+                            .positives
+                            .into_iter()
+                            .map(|v| api::grpc::qdrant::Vector { data: v })
+                            .collect(),
+                        negatives: named
+                            .query
+                            .negatives
+                            .into_iter()
+                            .map(|v| api::grpc::qdrant::Vector { data: v })
+                            .collect(),
+                    },
+                )),
+            },
+        }
+    }
+}
+
 impl<'a> From<CollectionCoreSearchRequest<'a>> for api::grpc::qdrant::CoreSearchPoints {
     fn from(value: CollectionCoreSearchRequest<'a>) -> Self {
         let (collection_id, request) = value.0;
 
         Self {
             collection_name: collection_id,
-            // query: Some(request.query.into()),
+            query: Some(request.query.clone().into()),
             filter: request.filter.clone().map(|f| f.into()),
             limit: request.limit as u64,
             with_vectors: request.with_vector.clone().map(|wv| wv.into()),
@@ -789,8 +821,24 @@ impl TryFrom<api::grpc::qdrant::CoreSearchPoints> for CoreSearchRequest {
     type Error = Status;
 
     fn try_from(value: api::grpc::qdrant::CoreSearchPoints) -> Result<Self, Self::Error> {
+        let query = value
+            .query
+            .and_then(|query| query.query)
+            .map(|query| match query {
+                api::grpc::qdrant::query_enum::Query::RecommendBestScore(query) => {
+                    QueryEnum::RecommendBestScore(NamedRecoQuery {
+                        query: RecoQuery::new(
+                            query.positives.into_iter().map(|v| v.data).collect(),
+                            query.negatives.into_iter().map(|v| v.data).collect(),
+                        ),
+                        using: value.vector_name,
+                    })
+                }
+            })
+            .ok_or(Status::invalid_argument("Query is not specified"))?;
+
         Ok(Self {
-            query: QueryEnum::Other, // TODO(luis): replace with other queries from CoreSearchPoints
+            query,
             filter: value.filter.map(|f| f.try_into()).transpose()?,
             params: value.params.map(|p| p.into()),
             limit: value.limit as usize,
@@ -901,6 +949,29 @@ impl From<api::grpc::qdrant::LookupLocation> for LookupLocation {
     }
 }
 
+impl From<api::grpc::qdrant::RecommendStrategy> for RecommendStrategy {
+    fn from(value: api::grpc::qdrant::RecommendStrategy) -> Self {
+        match value {
+            api::grpc::qdrant::RecommendStrategy::AverageVector => RecommendStrategy::AverageVector,
+            api::grpc::qdrant::RecommendStrategy::TakeBestScore => RecommendStrategy::TakeBestScore,
+        }
+    }
+}
+
+impl TryFrom<Option<i32>> for RecommendStrategy {
+    type Error = Status;
+
+    fn try_from(value: Option<i32>) -> Result<Self, Self::Error> {
+        let strategy = match value {
+            None => api::grpc::qdrant::RecommendStrategy::AverageVector,
+            Some(i) => api::grpc::qdrant::RecommendStrategy::from_i32(i).ok_or_else(|| {
+                Status::invalid_argument(format!("Unknown recommend strategy: {}", i))
+            })?,
+        };
+        Ok(strategy.into())
+    }
+}
+
 impl TryFrom<api::grpc::qdrant::RecommendPoints> for RecommendRequest {
     type Error = Status;
 
@@ -916,6 +987,7 @@ impl TryFrom<api::grpc::qdrant::RecommendPoints> for RecommendRequest {
                 .into_iter()
                 .map(|p| p.try_into())
                 .collect::<Result<_, _>>()?,
+            strategy: value.strategy.try_into()?,
             filter: value.filter.map(|f| f.try_into()).transpose()?,
             params: value.params.map(|p| p.into()),
             limit: value.limit as usize,
@@ -941,6 +1013,7 @@ impl TryFrom<api::grpc::qdrant::RecommendPointGroups> for RecommendGroupsRequest
         let recommend_points = api::grpc::qdrant::RecommendPoints {
             positive: value.positive,
             negative: value.negative,
+            strategy: value.strategy,
             using: value.using,
             lookup_from: value.lookup_from,
             filter: value.filter,
@@ -957,6 +1030,7 @@ impl TryFrom<api::grpc::qdrant::RecommendPointGroups> for RecommendGroupsRequest
         let RecommendRequest {
             positive,
             negative,
+            strategy,
             using,
             lookup_from,
             filter,
@@ -971,6 +1045,7 @@ impl TryFrom<api::grpc::qdrant::RecommendPointGroups> for RecommendGroupsRequest
         Ok(RecommendGroupsRequest {
             positive,
             negative,
+            strategy,
             using,
             lookup_from,
             filter,
